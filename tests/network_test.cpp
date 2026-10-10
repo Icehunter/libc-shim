@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <cstdio>
 #include <cstring>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -186,6 +187,69 @@ namespace {
         if (memcmp(from.addr, mapped, 16) != 0) return fail(name, "address is not ::ffff:127.0.0.1");
         return true;
     }
+    bool test_recvmsg_stream_no_address() {
+        const char *name = "test_recvmsg_stream_no_address";
+        int fds[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) return fail(name, "socketpair");
+        ::write(fds[1], "s", 1);
+        char buf[8];
+        iovec iov = {buf, sizeof(buf)};
+        bionic::sockaddr_in6 from = {};
+        bionic_msghdr hdr = {};
+        hdr.msg_name = &from;
+        hdr.msg_namelen = sizeof(from);
+        hdr.msg_iov = &iov;
+        hdr.msg_iovlen = 1;
+        ssize_t n = -1;
+        try {
+            n = recv_into(fds[0], hdr);
+        } catch (...) {
+            ::close(fds[0]); ::close(fds[1]);
+            return fail(name, "recvmsg threw");
+        }
+        ::close(fds[0]); ::close(fds[1]);
+        if (n != 1) return fail(name, "wrong byte count");
+        if (hdr.msg_namelen != 0) return fail(name, "msg_namelen is not 0 when there is no address");
+        return true;
+    }
+
+    bool test_recvmsg_small_name_buffer() {
+        const char *name = "test_recvmsg_small_name_buffer";
+        int rx = shim::socket(bionic::af_family::INET6, bionic::socktype::DGRAM, bionic::ipproto::UDP);
+        int off = 0;
+        shim::setsockopt(rx, 41, 26, &off, sizeof(off));
+        bionic::sockaddr_in6 any6 = {};
+        any6.family = (uint16_t) bionic::af_family::INET6;
+        shim::bind(rx, &any6, sizeof(any6));
+        bionic::sockaddr_in6 bound = {};
+        socklen_t len = sizeof(bound);
+        shim::getsockname(rx, &bound, &len);
+        int tx = shim::socket(bionic::af_family::INET, bionic::socktype::DGRAM, bionic::ipproto::UDP);
+        bionic::sockaddr_in to = loopback_any_port();
+        to.port = bound.port;
+        shim::sendto(tx, "z", 1, 0, &to, sizeof(to));
+
+        char buf[8];
+        iovec iov = {buf, sizeof(buf)};
+        bionic::sockaddr_in small = {};
+        bionic_msghdr hdr = {};
+        hdr.msg_name = &small;
+        hdr.msg_namelen = sizeof(small);
+        hdr.msg_iov = &iov;
+        hdr.msg_iovlen = 1;
+        ssize_t n = -1;
+        try {
+            n = recv_into(rx, hdr);
+        } catch (...) {
+            ::close(rx); ::close(tx);
+            return fail(name, "recvmsg threw");
+        }
+        ::close(rx); ::close(tx);
+        if (n != 1) return fail(name, "wrong byte count");
+        if (hdr.msg_namelen != sizeof(bionic::sockaddr_in6)) return fail(name, "msg_namelen is not the full address size");
+        if (small.family != (uint16_t) bionic::af_family::INET6) return fail(name, "truncated address does not start with family 10");
+        return true;
+    }
 }
 
 int main() {
@@ -195,6 +259,8 @@ int main() {
         test_recvmsg_reused_header,
         test_recvmsg_reports_trunc,
         test_recvmsg_v4_mapped,
+        test_recvmsg_stream_no_address,
+        test_recvmsg_small_name_buffer,
     };
     int failed = 0;
     for (auto t : tests)

@@ -24,6 +24,7 @@
 #include <net/if.h>
 #include <arpa/inet.h>
 #include <cstring>
+#include <algorithm>
 #include <ifaddrs.h>
 
 namespace {
@@ -706,8 +707,16 @@ ssize_t shim::recvmsg(int sockfd, struct msghdr *data, int flags) {
     netdbg_log("recvmsg", sockfd, name ? haddr.ptr() : nullptr, val, bdata->msg_controllen, flags);
     if (val >= 0) {
         if (name) {
-            haddr.len = hdata.msg_namelen;
-            haddr.apply(name, &bdata->msg_namelen);
+            if (hdata.msg_namelen == 0) {
+                bdata->msg_namelen = 0;
+            } else {
+                // Like Linux: copy what fits in the caller's buffer and report the full length.
+                alignas(8) char full[sizeof(bionic::sockaddr_un) + 8] = {};
+                bionic::from_host(haddr.ptr(), (bionic::sockaddr *) full);
+                socklen_t full_len = bionic::get_bionic_len(haddr.ptr());
+                memcpy(name, full, std::min<socklen_t>(full_len, bdata->msg_namelen));
+                bdata->msg_namelen = full_len;
+            }
         }
         bdata->msg_controllen = 0;
         bdata->msg_flags = from_host_msg_flags(hdata.msg_flags);
