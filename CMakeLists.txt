@@ -41,3 +41,9 @@ check_cxx_source_compiles("
 if(NOT HAVE_ATOMICS_WITHOUT_LIB)
     target_link_libraries(libc-shim PRIVATE atomic)
 endif()
+
+option(LIBC_SHIM_BUILD_TESTS "Build the libc-shim tests" OFF)
+if(LIBC_SHIM_BUILD_TESTS)
+    add_executable(libc-shim-network-test tests/network_test.cpp)
+    target_link_libraries(libc-shim-network-test PRIVATE libc-shim)
+endif()

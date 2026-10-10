@@ -849,6 +849,9 @@ void shim::add_signal_shimmed_symbols(std::vector<shim::shimmed_symbol> &list) {
         {"sigprocmask", +[](int __how, const void * __set, void * __oset) -> int {
             return 0;
         }},
+        {"pthread_sigmask", +[](int __how, const void * __set, void * __oset) -> int {
+            return 0;
+        }},
         {"sigemptyset", +[](void*) -> int {
             return 0;
         }},

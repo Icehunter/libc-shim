@@ -26,6 +26,30 @@
 #include <cstring>
 #include <ifaddrs.h>
 
+namespace {
+    bool netdbg() {
+        static bool on = getenv("SHIM_NETDBG") != nullptr;
+        return on;
+    }
+
+    void netdbg_log(const char *fn, int fd, const ::sockaddr *sa, ssize_t ret, size_t len, int extra) {
+        if (!netdbg()) return;
+        char host[INET6_ADDRSTRLEN] = "-";
+        int port = 0;
+        if (sa && sa->sa_family == AF_INET) {
+            auto in = (const ::sockaddr_in *) sa;
+            inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
+            port = ntohs(in->sin_port);
+        } else if (sa && sa->sa_family == AF_INET6) {
+            auto in6 = (const ::sockaddr_in6 *) sa;
+            inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
+            port = ntohs(in6->sin6_port);
+        }
+        fprintf(stderr, "NETDBG %s fd=%d peer=%s:%d len=%zu ret=%zd errno=%d extra=%d\n", fn, fd, host, port, len, ret, ret < 0 ? errno : 0, extra);
+    }
+
+}
+
 using namespace shim;
 
 bionic::ai_flags bionic::from_host_ai_flags(int flags) {
@@ -355,7 +379,9 @@ int bionic::to_host_sockopt(int level, int opt) {
 }
 
 int shim::socket(bionic::af_family domain, bionic::socktype type, bionic::ipproto proto) {
-    return ::socket(bionic::to_host_af_family(domain), bionic::to_host_socktype(type), bionic::to_host_ipproto(proto));
+    int ret = ::socket(bionic::to_host_af_family(domain), bionic::to_host_socktype(type), bionic::to_host_ipproto(proto));
+    if (netdbg()) fprintf(stderr, "NETDBG socket domain=%d type=%d proto=%d ret=%d errno=%d\n", (int) domain, (int) type, (int) proto, ret, ret < 0 ? errno : 0);
+    return ret;
 }
 
 int shim::getaddrinfo(const char *node, const char *service, const bionic::addrinfo *hints, bionic::addrinfo **res) {
@@ -570,22 +596,82 @@ int shim::getnameinfo(const bionic::sockaddr *addr, socklen_t addrlen, char *hos
 
 int shim::bind(int sockfd, const bionic::sockaddr *addr, socklen_t addrlen) {
     detail::sockaddr_in haddr (addr, addrlen);
-    return ::bind(sockfd, haddr.ptr(), haddr.len);
+    int ret = ::bind(sockfd, haddr.ptr(), haddr.len);
+    netdbg_log("bind", sockfd, haddr.ptr(), ret, haddr.len, 0);
+    return ret;
 }
 
 int shim::connect(int sockfd, const bionic::sockaddr *addr, socklen_t addrlen) {
     detail::sockaddr_in haddr (addr, addrlen);
-    return ::connect(sockfd, haddr.ptr(), haddr.len);
+    int ret = ::connect(sockfd, haddr.ptr(), haddr.len);
+    netdbg_log("connect", sockfd, haddr.ptr(), ret, haddr.len, 0);
+    return ret;
 }
 
 ssize_t shim::send(int sockfd, const void *buf, size_t len, int flags) {
     detail::sock_send_flags hflags (sockfd, flags);
-    return ::send(sockfd, buf, len, hflags.flags);
+    auto ret = ::send(sockfd, buf, len, hflags.flags);
+    netdbg_log("send", sockfd, nullptr, ret, len, flags);
+    return ret;
+}
+
+namespace {
+    // struct msghdr as laid out by bionic on 64-bit Android. iovec matches the host layout.
+    struct bionic_msghdr {
+        void *msg_name;
+        socklen_t msg_namelen;
+        struct iovec *msg_iov;
+        size_t msg_iovlen;
+        void *msg_control;
+        size_t msg_controllen;
+        int msg_flags;
+    };
+
+    constexpr int BIONIC_MSG_CTRUNC = 0x8;
+    constexpr int BIONIC_MSG_TRUNC = 0x20;
+
+    int to_host_recv_flags(int flags) {
+        int ret = 0;
+        if (flags & 0x2) ret |= MSG_PEEK;
+        if (flags & BIONIC_MSG_TRUNC) ret |= MSG_TRUNC;
+        if (flags & 0x40) ret |= MSG_DONTWAIT;
+        if (flags & 0x100) ret |= MSG_WAITALL;
+        int known = 0x2 | BIONIC_MSG_TRUNC | 0x40 | 0x100 | 0x4000;
+        if (flags & ~known)
+            handle_runtime_error("recvmsg with unsupported flags %d", flags);
+        return ret;
+    }
+
+    int from_host_msg_flags(int flags) {
+        int ret = 0;
+        if (flags & MSG_TRUNC) ret |= BIONIC_MSG_TRUNC;
+        if (flags & MSG_CTRUNC) ret |= BIONIC_MSG_CTRUNC;
+        return ret;
+    }
+
+
+    void warn_control_once(const char *fn) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "libc-shim: %s called with control data, which is not translated\n", fn);
+        }
+    }
 }
 
 ssize_t shim::sendmsg(int sockfd, const msghdr *data, int flags) {
+    auto bdata = (const bionic_msghdr *) data;
+    detail::sockaddr_in haddr ((const bionic::sockaddr *) bdata->msg_name, bdata->msg_namelen);
+    struct ::msghdr hdata = {};
+    hdata.msg_name = haddr.ptr();
+    hdata.msg_namelen = haddr.ptr() ? haddr.len : 0;
+    hdata.msg_iov = bdata->msg_iov;
+    hdata.msg_iovlen = (int) bdata->msg_iovlen;
+    if (bdata->msg_control && bdata->msg_controllen) {
+        warn_control_once("sendmsg");
+    }
     detail::sock_send_flags hflags (sockfd, flags);
-    return ::sendmsg(sockfd, data, hflags.flags);
+    return ::sendmsg(sockfd, &hdata, hflags.flags);
 }
 
 ssize_t shim::recv(int sockfd, void *buf, size_t len, int flags) {
@@ -596,23 +682,35 @@ ssize_t shim::recv(int sockfd, void *buf, size_t len, int flags) {
     if(flags & 2) {
         nflags |= MSG_PEEK;
     }
-    return ::recv(sockfd, buf, len, nflags);
+    auto ret = ::recv(sockfd, buf, len, nflags);
+    netdbg_log("recv", sockfd, nullptr, ret, len, flags);
+    return ret;
 }
 
 ssize_t shim::recvmsg(int sockfd, struct msghdr *data, int flags) {
-    if (flags != 0)
-        handle_runtime_error("recvmsg with unsupported flags %d", flags);
-    auto name = (bionic::sockaddr*)data->msg_name;
-    auto addrlen = data->msg_namelen;
+    auto bdata = (bionic_msghdr *) data;
+    auto name = (bionic::sockaddr *) bdata->msg_name;
     detail::sockaddr_out haddr;
-    if(name) {
-        data->msg_name = haddr.ptr();
-        data->msg_namelen = haddr.len;
+    struct ::msghdr hdata = {};
+    if (name) {
+        hdata.msg_name = haddr.ptr();
+        hdata.msg_namelen = haddr.len;
+    }
+    hdata.msg_iov = bdata->msg_iov;
+    hdata.msg_iovlen = (int) bdata->msg_iovlen;
+    if (bdata->msg_control && bdata->msg_controllen) {
+        warn_control_once("recvmsg");
     }
 
-    auto val = ::recvmsg(sockfd, data, flags);
-    if(val > 0 && name) {
-        haddr.apply(name, &data->msg_namelen);
+    auto val = ::recvmsg(sockfd, &hdata, to_host_recv_flags(flags));
+    netdbg_log("recvmsg", sockfd, name ? haddr.ptr() : nullptr, val, bdata->msg_controllen, flags);
+    if (val >= 0) {
+        if (name) {
+            haddr.len = hdata.msg_namelen;
+            haddr.apply(name, &bdata->msg_namelen);
+        }
+        bdata->msg_controllen = 0;
+        bdata->msg_flags = from_host_msg_flags(hdata.msg_flags);
     }
     return val;
 }
@@ -620,7 +718,9 @@ ssize_t shim::recvmsg(int sockfd, struct msghdr *data, int flags) {
 ssize_t shim::sendto(int sockfd, const void *buf, size_t len, int flags, const bionic::sockaddr *addr, socklen_t addrlen) {
     detail::sockaddr_in haddr (addr, addrlen);
     detail::sock_send_flags hflags (sockfd, flags);
-    return ::sendto(sockfd, buf, len, hflags.flags, haddr.ptr(), haddr.len);
+    auto ret = ::sendto(sockfd, buf, len, hflags.flags, haddr.ptr(), haddr.len);
+    netdbg_log("sendto", sockfd, haddr.ptr(), ret, len, flags);
+    return ret;
 }
 
 ssize_t shim::recvfrom(int sockfd, void *buf, size_t len, int flags, bionic::sockaddr *addr, socklen_t *addrlen) {
@@ -630,6 +730,7 @@ ssize_t shim::recvfrom(int sockfd, void *buf, size_t len, int flags, bionic::soc
         return ::recvfrom(sockfd, buf, len, flags, nullptr, nullptr);
     detail::sockaddr_out haddr;
     int ret = ::recvfrom(sockfd, buf, len, flags, haddr.ptr(), &haddr.len);
+    netdbg_log("recvfrom", sockfd, haddr.ptr(), ret, len, flags);
     if (ret >= 0)
         haddr.apply(addr, addrlen);
         return ret;
@@ -672,6 +773,7 @@ int shim::getsockopt(int sockfd, int level, int optname, void *optval, socklen_t
 }
 
 int shim::setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+    if (netdbg()) fprintf(stderr, "NETDBG setsockopt fd=%d level=%d opt=%d len=%u\n", sockfd, level, optname, optlen);
     return ::setsockopt(sockfd, bionic::to_host_sockopt_level(level), bionic::to_host_sockopt(level, optname), optval, optlen);
 }
 
