@@ -3,6 +3,7 @@
 #include <cstring>
 
 static std::string iorewrite0(const char * path) {
+    if(path && shim::path_observer) shim::path_observer(path);
     auto len = path ? strlen(path) : 0;
     if(len > 0) {
         for(auto&& kv : shim::rewrite_filesystem_access) {
