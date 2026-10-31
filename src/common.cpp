@@ -899,6 +899,7 @@ void shim::add_string_shimmed_symbols(std::vector<shim::shimmed_symbol> &list) {
         {"strtok_r", ::strtok_r},
         {"strerror", strerror},
         {"strerror_r", strerror_r},
+        {"__gnu_strerror_r", gnu_strerror_r},
         {"strnlen", ::strnlen},
         {"strncat", ::strncat},
         {"strndup", ::strndup},

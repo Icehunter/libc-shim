@@ -1,6 +1,7 @@
 #include "errno.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 
 char *shim::strerror(int err) {
@@ -15,6 +16,12 @@ int shim::strerror_r(int err, char* buf, size_t len) {
 #else
     return ::strerror_r(bionic::translate_errno_to_host(err), buf, len);
 #endif
+}
+
+char *shim::gnu_strerror_r(int err, char* buf, size_t len) {
+    if (::strerror_r(bionic::translate_errno_to_host(err), buf, len) != 0)
+        std::snprintf(buf, len, "Unknown error %d", err);
+    return buf;
 }
 
 #ifdef ERRNO_TRANSLATION

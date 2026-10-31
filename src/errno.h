@@ -39,6 +39,9 @@ namespace shim {
 
     int strerror_r(int err, char* buf, size_t len);
 
+    // Bionic's __gnu_strerror_r (the GNU signature: returns the message, not a status).
+    char *gnu_strerror_r(int err, char* buf, size_t len);
+
 
     namespace detail {
 
