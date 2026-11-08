@@ -6,6 +6,8 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <cerrno>
+#include <chrono>
 
 using namespace shim;
 
@@ -250,6 +252,91 @@ namespace {
         if (small.family != (uint16_t) bionic::af_family::INET6) return fail(name, "truncated address does not start with family 10");
         return true;
     }
+    struct bionic_mmsghdr {
+        bionic_msghdr msg_hdr;
+        unsigned int msg_len;
+    };
+
+    bool test_batch_messages_bionic_layout() {
+        const char *name = "test_batch_messages_bionic_layout";
+        udp_pair p;
+        if (!open_pair(p)) return fail(name, "socket setup");
+        char first[] = "alpha", second[] = "beta";
+        iovec send_iov[2] = {{first, 5}, {second, 4}};
+        bionic_mmsghdr send_headers[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            send_headers[i].msg_hdr.msg_name = &p.rx_addr;
+            send_headers[i].msg_hdr.msg_namelen = sizeof(p.rx_addr);
+            send_headers[i].msg_hdr.msg_iov = &send_iov[i];
+            send_headers[i].msg_hdr.msg_iovlen = 1;
+        }
+        int sent = shim::sendmmsg(p.tx, reinterpret_cast<const mmsghdr *>(send_headers), 2, 0);
+        char payloads[3][16] = {};
+        iovec recv_iov[3];
+        bionic::sockaddr_in from[3] = {};
+        bionic_mmsghdr received[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            recv_iov[i] = {payloads[i], sizeof(payloads[i])};
+            received[i].msg_hdr.msg_name = &from[i];
+            received[i].msg_hdr.msg_namelen = sizeof(from[i]);
+            received[i].msg_hdr.msg_iov = &recv_iov[i];
+            received[i].msg_hdr.msg_iovlen = 1;
+            received[i].msg_hdr.msg_flags = 0x12345678;
+            received[i].msg_len = 0xfeed;
+        }
+        // Wait for both packets: send completion does not guarantee that both
+        // datagrams are already observable by a nonblocking receiver.
+        timespec deliveryTimeout = {1, 0};
+        int count = shim::recvmmsg(p.rx, reinterpret_cast<mmsghdr *>(received), 2, 0, &deliveryTimeout);
+        // Android DONTWAIT=0x40 and NOSIGNAL=0x4000 on an empty queue.
+        int empty = shim::recvmmsg(p.rx, reinterpret_cast<mmsghdr *>(&received[2]), 1, 0x4040, nullptr);
+        int emptyError = errno;
+        if (sent != 2 || send_headers[0].msg_len != 5 || send_headers[1].msg_len != 4)
+            return fail(name, "send batch stride or lengths");
+        if (count != 2 || received[0].msg_len != 5 || received[1].msg_len != 4 || received[2].msg_len != 0xfeed) {
+            fprintf(stderr, "batch receive count=%d lengths=%u,%u,%u errno=%d headerSize=%zu batchSize=%zu\n",
+                    count, received[0].msg_len, received[1].msg_len, received[2].msg_len, errno,
+                    sizeof(bionic_msghdr), sizeof(bionic_mmsghdr));
+            close_pair(p);
+            return fail(name, "receive stride or lengths");
+        }
+        if (memcmp(payloads[0], "alpha", 5) || memcmp(payloads[1], "beta", 4))
+            return fail(name, "batch payloads");
+        for (int i = 0; i < 2; ++i) {
+            if (from[i].family != (uint16_t)bionic::af_family::INET || from[i].port != p.tx_addr.port)
+                return fail(name, "translated sender address");
+            if (received[i].msg_hdr.msg_flags != 0 || received[i].msg_hdr.msg_controllen != 0 ||
+                received[i].msg_hdr.msg_name != &from[i])
+                return fail(name, "translated header output");
+        }
+        if (empty != -1 || (emptyError != EAGAIN && emptyError != EWOULDBLOCK)) {
+            close_pair(p);
+            return fail(name, "empty nonblocking batch");
+        }
+        send_bytes(p, "partial", 7);
+        timespec partialTimeout = {0, 50000000};
+        int partial = shim::recvmmsg(p.rx, reinterpret_cast<mmsghdr *>(received), 3, 0, &partialTimeout);
+        close_pair(p);
+        if (partial != 1 || received[0].msg_len != 7 || received[1].msg_len != 4 || received[2].msg_len != 0xfeed)
+            return fail(name, "partial batch timeout or untouched trailing lengths");
+        return true;
+    }
+
+    bool test_recvmmsg_initial_timeout() {
+        const char *name = "test_recvmmsg_initial_timeout";
+        udp_pair p;
+        if (!open_pair(p)) return fail(name, "socket setup");
+        char payload[8];
+        iovec iov = {payload, sizeof(payload)};
+        bionic_mmsghdr header = {};
+        header.msg_hdr.msg_iov = &iov;
+        header.msg_hdr.msg_iovlen = 1;
+        timespec timeout = {0, 0};
+        int count = shim::recvmmsg(p.rx, reinterpret_cast<mmsghdr *>(&header), 1, 0, &timeout);
+        close_pair(p);
+        return count == 0 || fail(name, "empty batch did not time out before first receive");
+    }
+
 }
 
 int main() {
@@ -261,6 +348,8 @@ int main() {
         test_recvmsg_v4_mapped,
         test_recvmsg_stream_no_address,
         test_recvmsg_small_name_buffer,
+        test_batch_messages_bionic_layout,
+        test_recvmmsg_initial_timeout,
     };
     int failed = 0;
     for (auto t : tests)
